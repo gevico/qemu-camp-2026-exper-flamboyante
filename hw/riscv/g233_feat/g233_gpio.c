@@ -3,10 +3,7 @@
 #include "g233_gpio.h"
 #include "hw/core/irq.h"
 
-
-
-
-static void g233_update_state(G233GPIOState *s)
+static uint32_t g233_gpio_level(G233GPIOState *s)
 {
     /*
      * 当前训练营测试没有外部设备驱动 GPIO 输入 pin，所以外部输入先建模
@@ -14,56 +11,47 @@ static void g233_update_state(G233GPIOState *s)
      */
     uint32_t external_in = 0;
 
+    return (s->out & s->dir) | (external_in & ~s->dir);
+}
+
+static void g233_gpio_update_irq(G233GPIOState *s)
+{
+    s->is = s->edge_is | s->level_is;
+    qemu_set_irq(s->irq, (s->is & s->ie) != 0);
+}
+
+static void g233_gpio_eval_interrupt(G233GPIOState *s)
+{
+    uint32_t prev_in = s->prev_in;
+    uint32_t new_in = g233_gpio_level(s);
+    uint32_t edge_mask = ~s->trig;
+    uint32_t level_mask = s->trig;
+    uint32_t rising_edge = new_in & ~prev_in;
+    uint32_t falling_edge = prev_in & ~new_in;
+
     /*
      * GPIO_IN 表示当前 pin 电平：
      * - DIR=1 时，pin 处于输出模式，由 GPIO_OUT 驱动；
      * - DIR=0 时，pin 处于输入模式，由外部输入驱动。
      */
-    uint32_t new_in = (s->out & s->dir) | (external_in & ~s->dir);
+    s->in = new_in;
 
-    uint32_t enabled = s->ie;
-    uint32_t trig = s->trig;
-    uint32_t pol = s->pol; /* 0=low/falling, 1=high/rising */
-    uint32_t prev_in = s->prev_in;
-
-    /*
-     * 边沿检测：
-     * rising_edge 为 1 的 bit 表示对应 pin 发生 0 -> 1；
-     * falling_edge 为 1 的 bit 表示对应 pin 发生 1 -> 0。
-     */
-    uint32_t rising_edge = new_in & ~prev_in;
-    uint32_t falling_edge = prev_in & ~new_in;
+    /* Edge 中断是 sticky 的：检测到一次边沿后保持到 GPIO_IS W1C。 */
+    s->edge_is |= s->ie & edge_mask &
+        ((rising_edge & s->pol) | (falling_edge & ~s->pol));
 
     /*
-     * TRIG=0 表示边沿触发，所以取反后得到 edge_mask。
-     * POL=1 选择 rising，POL=0 选择 falling。
-     * GPIO_IE=1 的 pin 才允许置中断状态。
+     * Level 中断不是 sticky：每次按当前电平重算。这样 TRIG/POL 从
+     * level 切到 edge 时，旧 level 状态不会残留到 edge sticky 状态里。
      */
-    uint32_t edge_mask = ~trig;
-    uint32_t edge_status = enabled & edge_mask &
-        ((rising_edge & pol) | (falling_edge & ~pol));
-
-    /*
-     * TRIG=1 表示电平触发。POL=1 时高电平有效，POL=0 时低电平有效。
-     * level 状态不是 sticky：电平不满足后要从 GPIO_IS 中清掉。
-     */
-    uint32_t level_mask = trig;
-    uint32_t level_status = enabled & level_mask &
-        ((new_in & pol) | (~new_in & ~pol));
-
-    /* edge 中断是 sticky 的，出现一次边沿后保持到 guest 写 1 清除。 */
-    s->is |= edge_status;
-
-    /* level 中断按当前电平重算，只清 level 位，保留 edge sticky 位。 */
-    s->is &= ~level_mask;
-    s->is |= level_status;
+    s->level_is = s->ie & level_mask &
+        ((new_in & s->pol) | (~new_in & ~s->pol));
 
     /* 保存当前 pin 电平，并作为下一次边沿检测的历史值。 */
-    s->in = new_in;
     s->prev_in = new_in;
 
     /* 32 个 pin 汇总成一根 GPIO 中断线，接到 PLIC IRQ 2。 */
-    qemu_set_irq(s->irq, (s->is & s->ie) != 0);
+    g233_gpio_update_irq(s);
 }
 
 
@@ -130,23 +118,30 @@ static void g233_gpio_write(void *opaque, hwaddr offset, uint64_t value, unsigne
     switch (offset) {
     case G233_GPIO_DIR:
         s->dir = value;
+        g233_gpio_eval_interrupt(s);
         break;
     case G233_GPIO_OUT:
         s->out = value;
+        g233_gpio_eval_interrupt(s);
         break;
     case G233_GPIO_IN:
         break;
     case G233_GPIO_IE:
         s->ie = value;
+        g233_gpio_eval_interrupt(s);
         break;
     case G233_GPIO_IS:
-        s->is &= ~value;    
+        s->edge_is &= ~value;
+        s->level_is &= ~value;
+        g233_gpio_eval_interrupt(s);
         break;
     case G233_GPIO_TRIG:
         s->trig = value;
-        break;  
+        g233_gpio_eval_interrupt(s);
+        break;
     case G233_GPIO_POL:
         s->pol = value;
+        g233_gpio_eval_interrupt(s);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -154,10 +149,6 @@ static void g233_gpio_write(void *opaque, hwaddr offset, uint64_t value, unsigne
                       __func__, offset);
         break;
     }
-
-
-    g233_update_state(s);
-
 }
 
 
@@ -165,6 +156,8 @@ static const MemoryRegionOps g233_gpio_ops = {
     .read =  g233_gpio_read,
     .write = g233_gpio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
     .impl.min_access_size = 4,
     .impl.max_access_size = 4,
 };
@@ -181,7 +174,9 @@ static void g233_gpio_reset(DeviceState  *dev)
     s->trig = 0;
     s->pol = 0;
     s->prev_in = 0;
-    qemu_set_irq(s->irq, 0);
+    s->edge_is = 0;
+    s->level_is = 0;
+    g233_gpio_update_irq(s);
 }
 
 static void g233_gpio_realize(DeviceState *dev, Error **errp)
