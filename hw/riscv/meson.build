@@ -16,7 +16,7 @@ riscv_ss.add(when: 'CONFIG_MICROBLAZE_V', if_true: files('microblaze-v-generic.c
 riscv_ss.add(when: 'CONFIG_XIANGSHAN_KUNMINGHU', if_true: files('xiangshan_kmh.c'))
 riscv_ss.add(when: 'CONFIG_GEVICO_G233', if_true: files(
 	'g233.c', 'g233_feat/g233_gpio.c', 'g233_feat/g233_pwm.c',
-	'g233_feat/g233_wdt.c'))
+	'g233_feat/g233_wdt.c', 'g233_feat/g233_spi.c'))
 
 riscv_ss.add(when: 'CONFIG_RISCV_MIPS_CPS', if_true: files('cps.c'))
 riscv_ss.add(when: 'CONFIG_MIPS_BOSTON_AIA', if_true: files('boston-aia.c'))

@@ -62,6 +62,7 @@
 #include "hw/riscv/g233_feat/g233_gpio.h"
 #include "hw/riscv/g233_feat/g233_pwm.h"
 #include "hw/riscv/g233_feat/g233_wdt.h"
+#include "hw/riscv/g233_feat/g233_spi.h"
 
 /* KVM AIA only supports APLIC MSI. APLIC Wired is always emulated by QEMU. */
 static bool g233_use_kvm_aia_aplic_imsic(RISCVG233AIAType aia_type)
@@ -101,6 +102,7 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_WDT] =          { 0x10010000,         0x100 },
     [VIRT_GPIO] =         { 0x10012000,         0x100 },
     [VIRT_PWM] =          { 0x10015000,         0x100 },
+    [VIRT_SPI] =          { 0x10018000,         0x100 },
     [VIRT_FW_CFG] =       { 0x10100000,          0x18 },
     [VIRT_FLASH] =        { 0x20000000,     0x4000000 },
     [VIRT_IMSIC_M] =      { 0x24000000, VIRT_IMSIC_MAX_SIZE },
@@ -151,6 +153,18 @@ static void g233_wdt_create(hwaddr addr, qemu_irq irq)
     SysBusDevice *s;
 
     dev = qdev_new(TYPE_G233_WDT);
+    s = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(s, &error_fatal);
+    sysbus_mmio_map(s, 0, addr);
+    sysbus_connect_irq(s, 0, irq);
+}
+
+static void g233_spi_create(hwaddr addr, qemu_irq irq)
+{
+    DeviceState *dev;
+    SysBusDevice *s;
+
+    dev = qdev_new(TYPE_G233_SPI);
     s = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(s, &error_fatal);
     sysbus_mmio_map(s, 0, addr);
@@ -1765,6 +1779,9 @@ static void virt_machine_init(MachineState *machine)
 
     g233_wdt_create(s->memmap[VIRT_WDT].base,
                     qdev_get_gpio_in(mmio_irqchip, WDT_PLIC_IRQ));
+
+    g233_spi_create(s->memmap[VIRT_SPI].base,
+                    qdev_get_gpio_in(mmio_irqchip, SPI_PLIC_IRQ));
 
     for (i = 0; i < ARRAY_SIZE(s->flash); i++) {
         /* Map legacy -drive if=pflash to machine properties */
