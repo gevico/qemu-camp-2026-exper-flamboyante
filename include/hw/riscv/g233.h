@@ -80,6 +80,7 @@ enum {
     VIRT_APLIC_S,
     VIRT_UART0,
     VIRT_VIRTIO,
+    VIRT_WDT,
     VIRT_GPIO,
     VIRT_PWM,
     VIRT_FW_CFG,
@@ -97,6 +98,7 @@ enum {
 enum {
     GPIO_PLIC_IRQ = 2,
     PWM_PLIC_IRQ = 3,
+    WDT_PLIC_IRQ = 4,
     UART0_IRQ = 10,
     RTC_IRQ = 11,
     VIRTIO_IRQ = 1, /* 1 to 8 */
