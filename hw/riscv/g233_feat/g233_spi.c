@@ -9,7 +9,15 @@ static void g233_spi_update_irq(G233SPIState *s)
      * TODO(day4-spi-irq): 汇总 TXEIE/TXE、RXNEIE/RXNE、ERRIE/OVERRUN，
      * 并把结果驱动到 PLIC IRQ 5。
      */
-    qemu_set_irq(s->irq, 0);
+    if((s->cr1 & G233_SPI_CR1_SPE) == 0)
+    {
+        return;
+    }
+    bool irq = false;
+    irq = (s->cr1 & G233_SPI_CR1_TXEIE) && (s->sr & G233_SPI_SR_TXE);
+    irq |= (s->cr1 & G233_SPI_CR1_RXNEIE) && (s->sr & G233_SPI_SR_RXNE);
+    irq |= (s->cr1 & G233_SPI_CR1_ERRIE) && (s->sr & G233_SPI_SR_OVERRUN);
+    qemu_set_irq(s->irq, irq);
 }
 
 static void g233_spi_flash_reset_transaction(G233SPIFlash *flash)
@@ -28,23 +36,220 @@ static void g233_spi_flash_busy_done(void *opaque)
 {
     G233SPIFlash *flash = opaque;
 
+    if(flash->program_touched == false && flash->erase_pending == false)
+    {
+        return;
+    }
+
     /*
-     * TODO(day4-spi-flash): 实现 BUSY/WEL 生命周期。这里应清 BUSY，
-     * 并在 program/erase 完成后清 WEL。
-     */
-    flash->status = 0;
+    * TODO(day4-spi-flash): 实现 BUSY/WEL 生命周期。这里应清 BUSY，
+    * 并在 program/erase 完成后清 WEL。
+    */
+    flash->status &= ~G233_SPI_FLASH_SR_BUSY;
+    flash->status &= ~G233_SPI_FLASH_SR_WEL;
+    if(flash->cmd == G233_SPI_FLASH_CMD_PAGE_PROGRAM)
+    {
+        flash->program_touched = false;
+    }
+    else if(flash->cmd == G233_SPI_FLASH_CMD_SECTOR_ERASE)
+    {
+        flash->erase_pending = false;
+    }
+    flash->phase = G233_SPI_FLASH_PHASE_IDLE;
+    
 }
+
+static uint8_t g233_spi_flash_deal_cmd(G233SPIFlash *flash, uint8_t cmd)
+{
+    /*
+     * TODO(day4-spi-flash): 处理 JEDEC、READ_STATUS、WRITE_ENABLE、
+     * READ_DATA、PAGE_PROGRAM、SECTOR_ERASE 命令。
+     */
+    flash->cmd = cmd;
+    switch (cmd)
+    {
+    case G233_SPI_FLASH_CMD_JEDEC_ID:
+        flash->phase = G233_SPI_FLASH_PHASE_JEDEC;
+        break;
+    case G233_SPI_FLASH_CMD_READ_STATUS:
+        flash->phase = G233_SPI_FLASH_PHASE_STATUS;
+        break;
+    case G233_SPI_FLASH_CMD_WRITE_ENABLE:
+        flash->status |= G233_SPI_FLASH_SR_WEL; //WEL为1代表可以写
+        flash->phase = G233_SPI_FLASH_PHASE_IDLE;
+        break;
+    case G233_SPI_FLASH_CMD_READ_DATA:
+    case G233_SPI_FLASH_CMD_PAGE_PROGRAM:
+    case G233_SPI_FLASH_CMD_SECTOR_ERASE:
+        flash->phase = G233_SPI_FLASH_PHASE_ADDR;
+        break;
+    default:
+        flash->phase = G233_SPI_FLASH_PHASE_IDLE;   
+        break;
+    }
+    return 0xff;
+}
+
+
+static uint8_t g233_spi_flash_deal_jedec(G233SPIFlash *flash)
+{
+    /*
+     * TODO(day4-spi-flash): 处理 3 位 JEDEC ID。
+     */
+    uint8_t ret = flash->jedec[flash->jedec_pos];
+    flash->jedec_pos++;
+    if (flash->jedec_pos >= 3) {
+        flash->jedec_pos = 0;
+        flash->phase = G233_SPI_FLASH_PHASE_IDLE;
+    }
+    return ret;
+}
+
+static uint8_t g233_spi_flash_deal_status(G233SPIFlash *flash)
+{
+    /*
+     * TODO(day4-spi-flash): 处理 STATUS 字节。
+     */
+    uint8_t ret = flash->status;
+    flash->phase = G233_SPI_FLASH_PHASE_IDLE;
+    return ret;
+}
+
+
+static uint8_t g233_spi_flash_deal_addr(G233SPIFlash *flash, uint8_t tx)
+{
+    /*
+     * TODO(day4-spi-flash): 处理 32位地址。
+     */
+    flash->addr_bytes++;
+    flash->addr |= (tx << (flash->addr_bytes * 8));
+    if (flash->addr_bytes >= 3) {
+        flash->addr_bytes = 0;
+        switch (flash->cmd)
+        {
+        case G233_SPI_FLASH_CMD_PAGE_PROGRAM:
+            flash->phase = G233_SPI_FLASH_PHASE_PROGRAM;
+            break;
+        case G233_SPI_FLASH_CMD_SECTOR_ERASE:
+            flash->erase_addr = flash->addr;
+            flash->phase = G233_SPI_FLASH_PHASE_ERASE;
+            break;
+        case G233_SPI_FLASH_CMD_READ_DATA:
+            flash->phase = G233_SPI_FLASH_PHASE_READ_DATA;
+            break;  
+        default:
+            break;
+        }
+    }
+    return 0xff;
+}
+
+
+static uint8_t g233_spi_flash_deal_read_data(G233SPIFlash *flash)
+{
+    /*
+     * TODO(day4-spi-flash): 处理 READ_DATA 字节。
+     */
+    if(flash->addr >= flash->size)
+    {
+        return 0xff;
+    }   
+    uint8_t ret = flash->storage[flash->addr];
+    flash->addr++;
+    return ret;
+}
+
+static uint8_t g233_spi_flash_deal_program(G233SPIFlash *flash, uint8_t tx)
+{
+    /*
+     * TODO(day4-spi-flash): 处理 PAGE_PROGRAM 字节。
+     * - 检查地址是否超出范围
+     * - 检查 WEL 是否为 1，检查是否busy
+     * - 设置 busy
+     * - 启动 program_touched
+     * 
+     * - 增加地址
+     */
+    if(flash->addr >= flash->size)
+    {
+        return 0xff;
+    }
+    if((flash->status & G233_SPI_FLASH_SR_WEL) == 0)
+    {
+        return 0xff;
+    }
+    if((flash->status & G233_SPI_FLASH_SR_BUSY) != 0)
+    {
+        return 0xff;
+    }
+
+    //flash->status |= G233_SPI_FLASH_SR_BUSY;
+    flash->storage[flash->addr] &= tx;
+    flash->addr++;
+    // int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    // timer_mod(flash->busy_timer, now + 1000 *1000);
+    flash->program_touched = true;
+    return 0xff;
+}
+
+static uint8_t g233_spi_flash_deal_erase(G233SPIFlash *flash)
+{
+    if(flash->erase_addr >= flash->size)
+    {
+        return 0xff;
+    }
+    if((flash->status & G233_SPI_FLASH_SR_WEL) == 0)
+    {
+        return 0xff;
+    }
+    if((flash->status & G233_SPI_FLASH_SR_BUSY) != 0)
+    {
+        return 0xff;
+    }
+
+    flash->storage[flash->erase_addr] = 0xff;
+    flash->erase_pending = true;
+    return 0xff;
+
+}
+
 
 static uint8_t g233_spi_flash_xfer(G233SPIFlash *flash, uint8_t tx)
 {
-    (void)flash;
-    (void)tx;
-
+    
+    uint8_t ret = 0xff;
     /*
      * TODO(day4-spi-flash): 实现 JEDEC、READ_STATUS、WRITE_ENABLE、
      * READ_DATA、PAGE_PROGRAM、SECTOR_ERASE 的逐字节状态机。
      */
-    return 0xff;
+    switch (flash->phase)
+    {
+    case G233_SPI_FLASH_PHASE_IDLE:
+        /* code */
+        ret = g233_spi_flash_deal_cmd(flash, tx);
+        break;
+    case G233_SPI_FLASH_PHASE_JEDEC:
+        ret = g233_spi_flash_deal_jedec(flash);
+        break;
+    case G233_SPI_FLASH_PHASE_STATUS:
+        ret = g233_spi_flash_deal_status(flash);
+        break;
+    case G233_SPI_FLASH_PHASE_ADDR:
+        ret = g233_spi_flash_deal_addr(flash, tx);
+        break;
+    case G233_SPI_FLASH_PHASE_READ_DATA:
+        ret = g233_spi_flash_deal_read_data(flash);
+        break;
+    case G233_SPI_FLASH_PHASE_PROGRAM:
+        ret = g233_spi_flash_deal_program(flash, tx);
+        break;
+    case G233_SPI_FLASH_PHASE_ERASE:
+        ret = g233_spi_flash_deal_erase(flash);
+        break;
+    default:
+        break;
+    }
+    return ret;
 }
 
 static void g233_spi_flash_cs_deassert(G233SPIFlash *flash)
@@ -53,6 +258,13 @@ static void g233_spi_flash_cs_deassert(G233SPIFlash *flash)
      * TODO(day4-spi-cs): CS 切换时 finalize 当前 transaction。后续需要在
      * 这里收尾 PAGE_PROGRAM/SECTOR_ERASE，并启动 busy_timer。
      */
+    
+    if((flash->status & G233_SPI_FLASH_SR_WEL) != 0)
+    {
+        flash->status |= G233_SPI_FLASH_SR_BUSY;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_mod(flash->busy_timer, now + 100000);
+    }
     g233_spi_flash_reset_transaction(flash);
 }
 
@@ -67,8 +279,21 @@ static void g233_spi_transfer_done(void *opaque)
      * - 处理 RXNE/TXE/OVERRUN；
      * - 调用 g233_spi_update_irq()。
      */
-    s->rx = g233_spi_flash_xfer(&s->flash[0], s->tx);
+    unsigned cs = s->cr2 & G233_SPI_CR2_CS_MASK;
+    if (cs < G233_SPI_NR_FLASH) {
+        s->rx = g233_spi_flash_xfer(&s->flash[cs], s->tx);
+    } else {
+        s->rx = 0xff;
+    }
+
+    if (s->rx & G233_SPI_SR_RXNE)
+    {
+        s->sr |= G233_SPI_SR_OVERRUN;
+    }
+
+    s->sr |= G233_SPI_SR_RXNE;
     s->sr |= G233_SPI_SR_TXE;
+
     g233_spi_update_irq(s);
 }
 
@@ -89,6 +314,8 @@ static uint64_t g233_spi_read(void *opaque, hwaddr offset, unsigned int size)
         /*
          * TODO(day4-spi-controller): 读 DR 应返回 rx，并清 RXNE。
          */
+        s->sr &= ~G233_SPI_SR_RXNE;
+        g233_spi_update_irq(s);
         return s->rx;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -126,14 +353,35 @@ static void g233_spi_write(void *opaque, hwaddr offset,
          * TODO(day4-spi-overrun): SPI_SR.OVERRUN 是 W1C，其它状态位由
          * controller 行为维护。
          */
+        s->sr &= ~(val & G233_SPI_SR_OVERRUN);
+        g233_spi_update_irq(s);
         break;
     case G233_SPI_DR:
+    {
         /*
          * TODO(day4-spi-controller): 写 DR 应保存低 8 位 tx，清 TXE，并
          * 用 xfer_timer 安排一次 transfer。
          */
+        if (!(s->cr1 & G233_SPI_CR1_SPE)) 
+        {
+            return;
+        }
+
+        if (!(s->sr & G233_SPI_SR_TXE)) 
+        {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                        "G233 SPI write DR while TXE=0\n");
+            return;
+        }   
+
+
         s->tx = val;
+        s->sr &= ~G233_SPI_SR_TXE;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_mod(s->xfer_timer, now + 1000);
+        g233_spi_update_irq(s);
         break;
+    }
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "G233 SPI write to bad offset 0x%" HWADDR_PRIx "\n",
