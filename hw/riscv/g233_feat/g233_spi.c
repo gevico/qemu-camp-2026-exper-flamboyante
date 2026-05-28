@@ -127,6 +127,8 @@ static void g233_spi_flash_reset_transaction(G233SPIFlash *flash)
     flash->cmd = 0;
     flash->addr = 0;
     flash->addr_bytes = 0;
+    flash->program_touched = false;
+    flash->erase_pending = false;
     flash->jedec_pos = 0;
     flash->erase_addr = 0;
     flash->phase = G233_SPI_FLASH_PHASE_IDLE;
@@ -135,7 +137,6 @@ static void g233_spi_flash_reset_transaction(G233SPIFlash *flash)
 static void g233_spi_flash_busy_done(void *opaque)
 {
     G233SPIFlash *flash = opaque;
-    static bool warned_busy_done_early;
 
     SPI_DBG(SPI_CLR_TIMER,
             "busy_done enter cmd=0x%02x(%s) phase=%s status=0x%02x "
@@ -144,16 +145,6 @@ static void g233_spi_flash_busy_done(void *opaque)
             g233_spi_phase_name(flash->phase), flash->status,
             flash->program_touched, flash->erase_pending);
 
-    if(flash->program_touched == false && flash->erase_pending == false)
-    {
-        if (!warned_busy_done_early) {
-            SPI_WARN("busy_done early return: no pending program/erase, "
-                     "status stays 0x%02x; suppressing repeats",
-                     flash->status);
-            warned_busy_done_early = true;
-        }
-        return;
-    }
 
     /*
     * TODO(day4-spi-flash): 实现 BUSY/WEL 生命周期。这里应清 BUSY，
@@ -161,17 +152,9 @@ static void g233_spi_flash_busy_done(void *opaque)
     */
     flash->status &= ~G233_SPI_FLASH_SR_BUSY;
     flash->status &= ~G233_SPI_FLASH_SR_WEL;
-    if(flash->cmd == G233_SPI_FLASH_CMD_PAGE_PROGRAM)
-    {
-        flash->program_touched = false;
-    }
-    else if(flash->cmd == G233_SPI_FLASH_CMD_SECTOR_ERASE)
-    {
-        flash->erase_pending = false;
-    }
-    flash->phase = G233_SPI_FLASH_PHASE_IDLE;
-    SPI_INFO(SPI_CLR_TIMER, "busy_done exit status=0x%02x phase=%s",
-             flash->status, g233_spi_phase_name(flash->phase));
+
+    SPI_INFO(SPI_CLR_TIMER, "busy_done exit status=0x%02x phase=%s erase_pending=%d program_touched=%d\n",
+             flash->status, g233_spi_phase_name(flash->phase), flash->erase_pending, flash->program_touched);
 
 }
 
@@ -247,8 +230,8 @@ static uint8_t g233_spi_flash_deal_addr(G233SPIFlash *flash, uint8_t tx)
     /*
      * TODO(day4-spi-flash): 处理 32位地址。
      */
+    flash->addr = (flash->addr << 8) | tx;
     flash->addr_bytes++;
-    flash->addr |= (tx << (flash->addr_bytes * 8));
     SPI_DBG(SPI_CLR_FLASH,
             "addr byte tx=0x%02x cmd=0x%02x(%s) addr=0x%06x "
             "addr_bytes=%d",
