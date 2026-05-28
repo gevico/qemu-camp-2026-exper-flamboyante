@@ -104,6 +104,7 @@ static void g233_spi_update_irq(G233SPIState *s)
      */
     if((s->cr1 & G233_SPI_CR1_SPE) == 0)
     {
+        qemu_set_irq(s->irq, 0);
         return;
     }
     bool irq = false;
@@ -472,7 +473,7 @@ static void g233_spi_transfer_done(void *opaque)
         s->rx = 0xff;
     }
 
-    if (s->rx & G233_SPI_SR_RXNE)
+    if (old_sr & G233_SPI_SR_RXNE)
     {
         s->sr |= G233_SPI_SR_OVERRUN;
     }
